@@ -1,13 +1,17 @@
 """
-Proposal Submission Pipeline - team tracker (Streamlit + SQLite)
+Proposal Submission Pipeline - team tracker (Streamlit + Supabase/Postgres)
 
 Run:              streamlit run app.py
-Requirements:     pip install "streamlit>=1.50" openpyxl pandas
+Requirements:     see requirements.txt
 
-Data is stored in a local SQLite file (proposals.db, next to this script).
+Storage
+  * If a `database_url` secret is set (Streamlit Cloud -> App settings -> Secrets),
+    data lives in that Postgres database (Supabase). It survives restarts.
+  * If not, the app falls back to a local SQLite file (proposals.db) so you can
+    still run and test it on your own computer.
+
 Everyone who can reach the app can VIEW the tracker. Only people who enter the
-shared password can add / edit / delete proposals. Set the password in
-.streamlit/secrets.toml  (edit_password = "...")  or the EDIT_PASSWORD env var.
+shared password can add / edit / delete proposals.
 """
 from __future__ import annotations
 
@@ -16,8 +20,8 @@ import io
 import os
 import sqlite3
 import time
-from contextlib import closing
 import uuid
+from contextlib import closing
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -29,8 +33,9 @@ import streamlit as st
 # Settings - edit these lists to add a person / status / submission mode
 # ─────────────────────────────────────────────────────────────────────────────
 APP_TITLE = "Proposal Submission Pipeline"
+APP_SUBTITLE = "Deadlines, owners and submission status for every proposal in one place"
 TIMEZONE = "Asia/Karachi"          # used for "today" / overdue calculations
-SOON_DAYS = 3                      # deadlines within this many days turn amber
+SOON_DAYS = 3                      # deadlines within this many days count as "soon"
 
 PEOPLE = [
     "Irfan", "Ali Waheed", "Sajida", "Ayesha", "Zunaira",
@@ -46,15 +51,19 @@ MODES = [
     "Email + Online/Portal + Hard copy",
 ]
 STATUSES = ["Not Started Yet", "In Progress", "Submitted", "Not Submitted", "Declined", "Accepted"]
-CLOSED_STATUSES = {"Submitted", "Not Submitted"}   # no longer "open" work
+CLOSED_STATUSES = {"Submitted", "Not Submitted", "Declined", "Accepted"}   # no longer "open" work
 
-COLUMNS = ["ID", "Proposal", "Deadline", "Submission Mode", "Assigned to", "Status"]
-TEXT_COLUMNS = ["ID", "Proposal", "Submission Mode", "Assigned to", "Status"]
+# Column order here == the SELECT order in load_data()
+COLUMNS = ["ID", "Project No", "Proposal", "Deadline", "Submission Mode",
+           "Assigned to", "Status", "Remarks"]
+DB_COLUMNS = ["id", "project_no", "proposal", "deadline", "submission_mode",
+              "assigned_to", "status", "remarks"]
+TEXT_COLUMNS = ["ID", "Proposal", "Submission Mode", "Assigned to", "Status", "Remarks"]
 
-# The database file. Override with the PROPOSALS_DB environment variable if you
-# want it somewhere else (e.g. a OneDrive/Dropbox folder for automatic backup).
+# Local SQLite file: used when no database_url is set, and as a one-time import
+# source for Supabase (see _import_legacy_sqlite).
 DB_FILE = Path(os.environ.get("PROPOSALS_DB") or Path(__file__).with_name("proposals.db"))
-# If present, imported once when the database is first created.
+# If present, imported once when a brand-new local database is created.
 SEED_FILE = Path(__file__).with_name("seed_proposals.csv")
 
 # Row colour by Status. Semi-transparent so they look right in both light and dark themes.
@@ -74,6 +83,13 @@ EXCEL_FILLS = {
     "Declined": "F8CFCF",
     "Not Submitted": "F8CFCF",
 }
+# Summary-tile accent colours
+TILE_COLORS = {
+    "overdue": "#ef4444",   # red
+    "soon": "#6366f1",      # indigo
+    "progress": "#f59e0b",  # amber
+    "submitted": "#22c55e", # green
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -87,9 +103,7 @@ def today_local() -> date:
 
 
 def _secret(name: str, default=None):
-    """Read from Streamlit secrets, falling back to an environment variable."""
-    if name == "edit_password":
-        return "your-team-password"
+    """Read from Streamlit secrets, falling back to an environment variable."""    
     try:
         if name in st.secrets:
             return st.secrets[name]
@@ -110,11 +124,12 @@ def _width_kwargs() -> dict:
 
 
 def new_id() -> str:
-    return "p" + uuid.uuid4().hex[:8]     # leading letter so Sheets never reads it as a number
+    return "p" + uuid.uuid4().hex[:8]     # internal row key (not the visible Project ID)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Storage  (SQLite)
+# Storage  (Postgres/Supabase when database_url is set, otherwise SQLite)
+# All SQL below is written with %s placeholders and runs on both databases.
 # ─────────────────────────────────────────────────────────────────────────────
 def normalise(raw: pd.DataFrame) -> pd.DataFrame:
     """Coerce whatever came back from storage into a clean, typed frame."""
@@ -125,77 +140,200 @@ def normalise(raw: pd.DataFrame) -> pd.DataFrame:
     df = df[COLUMNS].dropna(how="all")
     for col in TEXT_COLUMNS:
         df[col] = df[col].fillna("").astype(str).str.strip()
+    df["Project No"] = pd.to_numeric(df["Project No"], errors="coerce").astype("Int64")
     df["Deadline"] = pd.to_datetime(df["Deadline"], errors="coerce", format="mixed")
     df = df[df["Proposal"] != ""].copy()
     missing = df["ID"] == ""
     df.loc[missing, "ID"] = [new_id() for _ in range(int(missing.sum()))]
+    # Visible Project ID: 001, 002, ...
+    df["Project ID"] = df["Project No"].map(lambda n: f"{int(n):03d}" if pd.notna(n) else "")
     return df.reset_index(drop=True)
 
 
-def _connect() -> sqlite3.Connection:
+def _database_url() -> str:
+    url = str(_secret("database_url") or "").strip()
+    return url if url.startswith(("postgres://", "postgresql://")) else ""
+
+
+def use_postgres() -> bool:
+    return bool(_database_url())
+
+
+def _connect():
+    if use_postgres():
+        import psycopg2
+
+        return psycopg2.connect(_database_url(), connect_timeout=10)
     con = sqlite3.connect(DB_FILE, timeout=15)   # wait if a teammate is mid-write
     con.execute("PRAGMA journal_mode=WAL")       # readers don't block the writer
     return con
 
 
-def _write(sql: str, params: tuple) -> None:
+def _sql(sql: str) -> str:
+    return sql if use_postgres() else sql.replace("%s", "?")
+
+
+def _write(sql: str, params: tuple = ()) -> None:
     with closing(_connect()) as con:
-        with con:                                 # commits on success
-            con.execute(sql, params)
+        cur = con.cursor()
+        cur.execute(_sql(sql), params)
+        con.commit()
 
 
-def init_db() -> None:
-    """Create the table; on the very first run, import seed_proposals.csv if it exists."""
-    first_run = not DB_FILE.exists()
+def _query(sql: str, params: tuple = ()) -> list:
     with closing(_connect()) as con:
-        with con:
-            con.execute(
-                """CREATE TABLE IF NOT EXISTS proposals (
-                       id TEXT PRIMARY KEY,
-                       proposal TEXT NOT NULL,
-                       deadline TEXT,
-                       submission_mode TEXT,
-                       assigned_to TEXT,
-                       status TEXT
-                   )"""
-            )
-    if first_run and SEED_FILE.exists():
-        for rec in normalise(pd.read_csv(SEED_FILE, dtype=str)).to_dict("records"):
-            upsert_proposal(rec)
+        cur = con.cursor()
+        cur.execute(_sql(sql), params)
+        return cur.fetchall()
 
 
-def load_data() -> pd.DataFrame:
-    init_db()
-    with closing(_connect()) as con:
-        raw = pd.read_sql_query(
-            'SELECT id AS ID, proposal AS Proposal, deadline AS Deadline, '
-            'submission_mode AS "Submission Mode", assigned_to AS "Assigned to", '
-            "status AS Status FROM proposals",
-            con,
-        )
-    return normalise(raw)
+_DDL_PROPOSALS = """CREATE TABLE IF NOT EXISTS proposals (
+    id TEXT PRIMARY KEY,
+    project_no INTEGER UNIQUE,
+    proposal TEXT NOT NULL,
+    deadline TEXT,
+    submission_mode TEXT,
+    assigned_to TEXT,
+    status TEXT,
+    remarks TEXT
+)"""
+_DDL_META = "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)"
 
 
-def upsert_proposal(record: dict) -> None:
-    """Insert, or update if the ID already exists. Only touches that one row."""
-    deadline = pd.Timestamp(record["Deadline"])
-    deadline = "" if pd.isna(deadline) else deadline.strftime("%Y-%m-%d")
+def _harden_postgres(cur) -> None:
+    """Supabase exposes tables to its public web API unless row-level security is on.
+    With RLS enabled and no policies, only our direct database connection can read/write."""
+    for table in ("proposals", "app_meta"):
+        cur.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+
+
+def _upgrade_old_sqlite(cur) -> None:
+    """Add the Project ID / Remarks columns to a pre-existing local proposals.db."""
+    have = {row[1] for row in cur.execute("PRAGMA table_info(proposals)").fetchall()}
+    if "project_no" not in have:
+        cur.execute("ALTER TABLE proposals ADD COLUMN project_no INTEGER")
+    if "remarks" not in have:
+        cur.execute("ALTER TABLE proposals ADD COLUMN remarks TEXT")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS proposals_project_no ON proposals (project_no)")
+
+
+def _import_legacy_sqlite() -> None:
+    """One-time: copy rows from a proposals.db sitting next to the app into Postgres.
+    Runs only if the database is still empty, and never twice (marker in app_meta)."""
+    if not DB_FILE.exists():
+        return
+    if _query("SELECT 1 FROM app_meta WHERE key = %s", ("legacy_import",)):
+        return
+    if _query("SELECT COUNT(*) FROM proposals")[0][0] == 0:
+        try:
+            with closing(sqlite3.connect(DB_FILE.resolve().as_uri() + "?mode=ro", uri=True)) as old:
+                have = [row[1] for row in old.execute("PRAGMA table_info(proposals)")]
+                select = ", ".join(c if c in have else "NULL" for c in DB_COLUMNS)
+                rows = [list(r) for r in old.execute(f"SELECT {select} FROM proposals ORDER BY rowid")]
+        except sqlite3.Error:
+            return                      # not a usable proposals.db - leave it alone
+        # Keep existing Project Nos; number the rest in the order they were created.
+        nxt = max((r[1] for r in rows if r[1] is not None), default=0) + 1
+        for r in rows:
+            if r[1] is None:
+                r[1], nxt = nxt, nxt + 1
+        with closing(_connect()) as con:
+            cur = con.cursor()
+            for r in rows:
+                cur.execute(
+                    _sql(
+                        "INSERT INTO proposals (id, project_no, proposal, deadline, submission_mode, "
+                        "assigned_to, status, remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT (id) DO NOTHING"
+                    ),
+                    tuple(r),
+                )
+            con.commit()
     _write(
-        """INSERT INTO proposals (id, proposal, deadline, submission_mode, assigned_to, status)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
-               proposal = excluded.proposal, deadline = excluded.deadline,
-               submission_mode = excluded.submission_mode,
-               assigned_to = excluded.assigned_to, status = excluded.status""",
-        (
-            record.get("ID") or new_id(), record["Proposal"], deadline,
-            record["Submission Mode"], record["Assigned to"], record["Status"],
-        ),
+        "INSERT INTO app_meta (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
+        ("legacy_import", "done"),
     )
 
 
+def _backfill_project_numbers() -> None:
+    """Give a Project No to any row that lacks one (e.g. added by hand in the database)."""
+    order = "id" if use_postgres() else "rowid"
+    for (pid,) in _query(f"SELECT id FROM proposals WHERE project_no IS NULL ORDER BY {order}"):
+        _write(
+            "UPDATE proposals SET project_no = "
+            "(SELECT COALESCE(MAX(project_no), 0) + 1 FROM proposals) WHERE id = %s",
+            (pid,),
+        )
+
+
+def init_db() -> None:
+    first_local_run = not use_postgres() and not DB_FILE.exists()
+    with closing(_connect()) as con:
+        cur = con.cursor()
+        cur.execute(_DDL_PROPOSALS)
+        cur.execute(_DDL_META)
+        if use_postgres():
+            _harden_postgres(cur)
+        else:
+            _upgrade_old_sqlite(cur)
+        con.commit()
+    if use_postgres():
+        _import_legacy_sqlite()
+    elif first_local_run and SEED_FILE.exists():
+        for rec in normalise(pd.read_csv(SEED_FILE, dtype=str)).to_dict("records"):
+            upsert_proposal(rec)
+    _backfill_project_numbers()
+
+
+@st.cache_resource(show_spinner=False)
+def _init_once(_url: str) -> bool:
+    """Create tables / import old data once per server start, not on every page refresh."""
+    init_db()
+    return True
+
+
+def load_data() -> pd.DataFrame:
+    _init_once(_database_url())
+    rows = _query(
+        "SELECT id, project_no, proposal, deadline, submission_mode, assigned_to, status, remarks "
+        "FROM proposals"
+    )
+    return normalise(pd.DataFrame(rows, columns=COLUMNS))
+
+
+def upsert_proposal(record: dict) -> None:
+    """Insert, or update if the ID already exists. Only touches that one row.
+    New rows get the next Project No automatically; existing rows keep theirs."""
+    deadline = pd.Timestamp(record["Deadline"])
+    deadline = "" if pd.isna(deadline) else deadline.strftime("%Y-%m-%d")
+    params = (
+        record.get("ID") or new_id(), record["Proposal"], deadline,
+        record["Submission Mode"], record["Assigned to"], record["Status"],
+        record.get("Remarks", ""),
+    )
+    sql = (
+        "INSERT INTO proposals (id, project_no, proposal, deadline, submission_mode, "
+        "assigned_to, status, remarks) "
+        "VALUES (%s, (SELECT COALESCE(MAX(project_no), 0) + 1 FROM proposals), %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (id) DO UPDATE SET "
+        "proposal = excluded.proposal, deadline = excluded.deadline, "
+        "submission_mode = excluded.submission_mode, assigned_to = excluded.assigned_to, "
+        "status = excluded.status, remarks = excluded.remarks"
+    )
+    for attempt in range(5):
+        try:
+            _write(sql, params)
+            return
+        except Exception as exc:
+            # Two people adding at the same instant can pick the same number: try again.
+            clash = type(exc).__name__ in ("IntegrityError", "UniqueViolation")
+            if not clash or attempt == 4:
+                raise
+            time.sleep(0.05)
+
+
 def delete_proposal(pid: str) -> None:
-    _write("DELETE FROM proposals WHERE id = ?", (pid,))
+    _write("DELETE FROM proposals WHERE id = %s", (pid,))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -246,8 +384,13 @@ def split_people(value: str) -> list[str]:
 
 def apply_filters(d: pd.DataFrame, search, statuses, people, open_only, window) -> pd.DataFrame:
     out = d
-    if search:
-        out = out[out["Proposal"].str.contains(search, case=False, regex=False)]
+    if search and search.strip():
+        s = search.strip()
+        out = out[
+            out["Proposal"].str.contains(s, case=False, regex=False)
+            | out["Project ID"].str.contains(s, case=False, regex=False)
+            | out["Remarks"].str.contains(s, case=False, regex=False)
+        ]
     if statuses:
         out = out[out["Status"].isin(statuses)]
     if people:
@@ -268,7 +411,7 @@ def to_excel_bytes(d: pd.DataFrame) -> bytes:
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
-    cols = ["Proposal", "Deadline", "Submission Mode", "Assigned to", "Status"]
+    cols = ["Project ID", "Proposal", "Deadline", "Submission Mode", "Assigned to", "Status", "Remarks"]
     out = d[cols].copy()
     out["Deadline"] = out["Deadline"].dt.date
 
@@ -282,11 +425,12 @@ def to_excel_bytes(d: pd.DataFrame) -> bytes:
             cell.font = Font(bold=True, color="FFFFFF")
             cell.fill = head_fill
             cell.alignment = Alignment(vertical="center")
-        widths = {"A": 52, "B": 12, "C": 32, "D": 34, "E": 16}
+        widths = {"A": 11, "B": 52, "C": 12, "D": 32, "E": 34, "F": 16, "G": 60}
         for letter, w in widths.items():
             ws.column_dimensions[letter].width = w
         for i, status in enumerate(d["Status"], start=2):
-            ws.cell(row=i, column=2).number_format = "d-mmm-yy"
+            ws.cell(row=i, column=3).number_format = "d-mmm-yy"
+            ws.cell(row=i, column=7).alignment = Alignment(wrap_text=True, vertical="top")
             fill = EXCEL_FILLS.get(status)
             if fill:
                 for c in range(1, len(cols) + 1):
@@ -294,6 +438,65 @@ def to_excel_bytes(d: pd.DataFrame) -> bytes:
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{max(len(out) + 1, 2)}"
     return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Styling (page header, summary tiles, section headings)
+# Colours are semi-transparent / inherited so they work in light and dark themes.
+# ─────────────────────────────────────────────────────────────────────────────
+_CSS = """
+[data-testid="stMainBlockContainer"], .block-container { padding-top: 3.4rem; padding-bottom: 2.5rem; }
+.app-banner {
+  display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap;
+  padding: 1.1rem 1.4rem; border-radius: 14px;
+  border: 1px solid rgba(148,163,184,.35); border-left: 6px solid #3b82f6;
+  background: linear-gradient(135deg, rgba(59,130,246,.16), rgba(99,102,241,.08));
+}
+.app-title { font-size: 2rem; font-weight: 800; letter-spacing: -.02em; line-height: 1.15; }
+.app-sub { margin-top: .3rem; font-size: .95rem; opacity: .72; }
+.app-date { text-align: right; font-size: .82rem; opacity: .8; line-height: 1.35; }
+.app-date strong { font-size: 1rem; }
+.sec-head {
+  display: flex; align-items: center; gap: .7rem; margin: 1.5rem 0 .75rem;
+  font-size: .78rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; opacity: .8;
+}
+.sec-head::after { content: ""; flex: 1; height: 1px; background: rgba(148,163,184,.4); }
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .9rem; }
+@media (max-width: 760px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.tile {
+  padding: .8rem 1.05rem .9rem; border-radius: 12px;
+  border: 1px solid rgba(148,163,184,.35); border-top: 4px solid var(--c);
+  background: rgba(148,163,184,.07);
+}
+.tile .lbl { font-size: .75rem; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; opacity: .72; }
+.tile .val { margin-top: .15rem; font-size: 2.3rem; font-weight: 800; line-height: 1.1; color: var(--c); }
+"""
+
+
+def _inject_css() -> None:
+    st.markdown("<style>" + _CSS + "</style>", unsafe_allow_html=True)
+
+
+def _banner_html(today: date) -> str:
+    return (
+        '<div class="app-banner"><div>'
+        f'<div class="app-title">{APP_TITLE}</div>'
+        f'<div class="app-sub">{APP_SUBTITLE}</div></div>'
+        f'<div class="app-date">{today:%A}<br><strong>{today:%d %b %Y}</strong></div></div>'
+    )
+
+
+def _section_html(label: str) -> str:
+    return f'<div class="sec-head">{label}</div>'
+
+
+def _tiles_html(items: list[tuple[str, int, str]]) -> str:
+    cards = "".join(
+        f'<div class="tile" style="--c:{color}"><div class="lbl">{label}</div>'
+        f'<div class="val">{int(value)}</div></div>'
+        for label, value, color in items
+    )
+    return f'<div class="tiles">{cards}</div>'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,6 +565,10 @@ def _proposal_form(record: dict | None, form_key: str) -> None:
     status_val = rec.get("Status") or "Not Started Yet"
 
     with st.form(form_key):
+        if rec.get("Project ID"):
+            st.caption(f"Project ID: **{rec['Project ID']}**")
+        else:
+            st.caption("The Project ID is assigned automatically when you save.")
         name = st.text_input("Proposal", value=rec.get("Proposal", ""))
         deadline = st.date_input("Deadline", value=deadline_default, format="DD/MM/YYYY")
         mode = st.selectbox("Submission mode", mode_opts, index=mode_idx, placeholder="Choose a mode")
@@ -370,6 +577,8 @@ def _proposal_form(record: dict | None, form_key: str) -> None:
             placeholder="Pick one or more people",
         )
         status = st.selectbox("Status", status_opts, index=status_opts.index(status_val))
+        remarks = st.text_area("Remarks", value=rec.get("Remarks", ""), height=100,
+                               placeholder="Optional notes, links, next steps…")
         saved = st.form_submit_button("Save", type="primary")
 
     if not saved:
@@ -388,6 +597,7 @@ def _proposal_form(record: dict | None, form_key: str) -> None:
             "Submission Mode": mode,
             "Assigned to": ", ".join(people),
             "Status": status,
+            "Remarks": remarks.strip(),
         })
     except Exception as exc:
         st.error(f"Could not save: {exc}")
@@ -426,40 +636,54 @@ def delete_dialog(pid: str, name: str) -> None:
 # Page
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="📋", layout="wide")
+    st.set_page_config(
+        page_title=APP_TITLE, page_icon="📋", layout="wide",
+        initial_sidebar_state="collapsed",       # sidebar opens only when the user opens it
+    )
+    _inject_css()
     sidebar_access()
 
-    st.title(APP_TITLE)
+    today = today_local()
+    st.markdown(_banner_html(today), unsafe_allow_html=True)
+
     try:
         df = load_data()
     except Exception as exc:
-        st.error(f"Couldn't open the database ({DB_FILE}): {exc}")
+        where = "the Supabase database" if use_postgres() else f"the local database ({DB_FILE})"
+        st.error(f"Couldn't connect to {where}: {str(exc).splitlines()[0] if str(exc) else type(exc).__name__}")
         st.stop()
 
-    today = today_local()
     data = decorate(df, today)
     open_mask = ~data["Status"].isin(CLOSED_STATUSES)
 
     # Summary tiles
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Overdue", int((data["_urgency"] == "overdue").sum()))
-    m2.metric("Due in next 7 days", int((open_mask & data["_days"].between(0, 7)).sum()))
-    m3.metric("In progress", int((data["Status"] == "In Progress").sum()))
-    m4.metric("Submitted", int((data["Status"] == "Submitted").sum()))
+    st.markdown(
+        _section_html("Overview")
+        + _tiles_html([
+            ("Overdue", int((data["_urgency"] == "overdue").sum()), TILE_COLORS["overdue"]),
+            ("Due in next 7 days", int((open_mask & data["_days"].between(0, 7)).sum()), TILE_COLORS["soon"]),
+            ("In progress", int((data["Status"] == "In Progress").sum()), TILE_COLORS["progress"]),
+            ("Submitted", int((data["Status"] == "Submitted").sum()), TILE_COLORS["submitted"]),
+        ]),
+        unsafe_allow_html=True,
+    )
 
     # Filters
-    f1, f2, f3, f4, f5 = st.columns([2.2, 1.6, 1.6, 1.4, 1.1])
-    search = f1.text_input("Search proposals", placeholder="Type part of a name…")
-    statuses = f2.multiselect("Status", _options(STATUSES, sorted(set(data["Status"]) - set(STATUSES))))
-    all_people = _options(PEOPLE, sorted({p for v in data["Assigned to"] for p in split_people(v)}))
-    people = f3.multiselect("Assigned to", all_people)
-    window = f4.selectbox("Deadline", ["Any time", "Overdue", "Next 7 days", "This month"])
-    open_only = f5.toggle("Open only", value=False, help="Hide Submitted / Not Submitted")
+    st.markdown(_section_html("Proposals"), unsafe_allow_html=True)
+    with st.container(border=True):
+        f1, f2, f3, f4, f5 = st.columns([2.4, 1.5, 1.5, 1.4, 1.5])
+        search = f1.text_input("Search", placeholder="Name, Project ID or remarks…")
+        statuses = f2.multiselect("Status", _options(STATUSES, sorted(set(data["Status"]) - set(STATUSES))))
+        all_people = _options(PEOPLE, sorted({p for v in data["Assigned to"] for p in split_people(v)}))
+        people = f3.multiselect("Assigned to", all_people)
+        window = f4.selectbox("Deadline", ["Any time", "Overdue", "Next 7 days", "This month"])
+        open_only = f5.toggle("Open only", value=False, help="Hide Submitted / Not Submitted / Declined / Accepted")
 
     view = apply_filters(data, search, statuses, people, open_only, window)
 
     # Table
-    display_cols = ["Proposal", "Deadline", "Time left", "Submission Mode", "Assigned to", "Status"]
+    display_cols = ["Project ID", "Proposal", "Deadline", "Time left", "Submission Mode",
+                    "Assigned to", "Status", "Remarks"]
     styled = view.style.apply(
         lambda row: [f"background-color: {ROW_COLORS.get(row['Status'], '')}"] * len(row), axis=1
     )
@@ -468,10 +692,13 @@ def main() -> None:
         hide_index=True,
         column_order=display_cols,
         column_config={
+            "Project ID": st.column_config.TextColumn("Project ID", width="small"),
             "Proposal": st.column_config.TextColumn("Proposal", width="large"),
             "Deadline": st.column_config.DateColumn("Deadline", format="DD MMM YYYY"),
             "Time left": st.column_config.TextColumn("Time left", width="small"),
+            "Remarks": st.column_config.TextColumn("Remarks", width="large"),
         },
+        height=max(120, min(36 * (len(view) + 1) + 4, 720)),
         on_select="rerun" if is_editor() else "ignore",
         selection_mode="single-row",
         key=f"table_{st.session_state.get('table_version', 0)}",
@@ -500,7 +727,7 @@ def main() -> None:
         if selected is None:
             st.caption("Tip: click a row's checkbox (left edge of the table) to edit or delete it.")
     else:
-        st.caption("🔒 View-only — unlock editing from the sidebar with the team password.")
+        st.caption("🔒 View-only — to edit, open the sidebar (arrow at the top-left) and enter the team password.")
 
     a5.download_button(
         "⬇️ Export to Excel",
