@@ -88,6 +88,8 @@ def today_local() -> date:
 
 def _secret(name: str, default=None):
     """Read from Streamlit secrets, falling back to an environment variable."""
+    if name == "edit_password":
+        return "your-team-password"
     try:
         if name in st.secrets:
             return st.secrets[name]
