@@ -16,6 +16,7 @@ shared password can add / edit / delete proposals.
 from __future__ import annotations
 
 import hmac
+import html
 import io
 import os
 import sqlite3
@@ -103,24 +104,13 @@ def today_local() -> date:
 
 
 def _secret(name: str, default=None):
-    """Read from Streamlit secrets, falling back to an environment variable."""    
+    """Read from Streamlit secrets, falling back to an environment variable."""
     try:
         if name in st.secrets:
             return st.secrets[name]
     except Exception:
         pass
     return os.environ.get(name.upper(), default)
-
-
-def _width_kwargs() -> dict:
-    """st.dataframe 'stretch' syntax differs between Streamlit versions."""
-    try:
-        major, minor = (int(x) for x in st.__version__.split(".")[:2])
-        if (major, minor) >= (1, 50):
-            return {"width": "stretch"}
-    except Exception:
-        pass
-    return {"use_container_width": True}
 
 
 def new_id() -> str:
@@ -470,6 +460,32 @@ _CSS = """
 }
 .tile .lbl { font-size: .75rem; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; opacity: .72; }
 .tile .val { margin-top: .15rem; font-size: 2.3rem; font-weight: 800; line-height: 1.1; color: var(--c); }
+
+/* ---- proposals table (rows built from HTML so every column fits and text wraps) ---- */
+.st-key-ptable { gap: .3rem !important; }
+.st-key-ptable [data-testid="stHorizontalBlock"] { gap: .5rem; align-items: center; }
+.st-key-ptable button { min-height: 2rem; padding: .1rem .5rem; border-radius: 8px; }
+.pt-grid {
+  display: grid; column-gap: .75rem; align-items: center;
+  grid-template-columns: 4rem minmax(0, 2.3fr) 6.4rem 6.2rem minmax(0, 1.3fr) minmax(0, 1.5fr) 7.4rem minmax(0, 2.2fr);
+}
+.pt-head {
+  padding: .35rem .8rem; font-size: .72rem; font-weight: 700; letter-spacing: .08em;
+  text-transform: uppercase; opacity: .7; border-bottom: 1px solid rgba(148,163,184,.4);
+}
+.pt-head-edit { font-size: .72rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; opacity: .7; text-align: center; }
+.pt-row {
+  padding: .5rem .8rem; border-radius: 8px; border: 1px solid rgba(148,163,184,.16);
+  font-size: .88rem; line-height: 1.35; overflow-wrap: anywhere;
+}
+.pt-row .c:nth-child(1) { font-weight: 600; opacity: .85; font-variant-numeric: tabular-nums; }
+.pt-row .c:nth-child(2) { font-weight: 600; }
+@media (max-width: 900px) {
+  .pt-head { display: none; }
+  .pt-grid.pt-row { grid-template-columns: 1fr 1fr; row-gap: .4rem; }
+  .pt-row .c::before { content: attr(data-l); display: block; font-size: .66rem; letter-spacing: .06em; text-transform: uppercase; opacity: .6; }
+  .pt-row .c:empty { display: none; }
+}
 """
 
 
@@ -497,6 +513,83 @@ def _tiles_html(items: list[tuple[str, int, str]]) -> str:
         for label, value, color in items
     )
     return f'<div class="tiles">{cards}</div>'
+
+
+TABLE_COLUMNS = ["Project ID", "Proposal", "Deadline", "Time left", "Submission Mode",
+                 "Assigned to", "Status", "Remarks"]
+EDIT_COL = [0.6, 12]          # [pencil button, rest of the row]
+
+
+def _esc(value) -> str:
+    """Escape user text for safe use inside our HTML rows."""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return ""
+    text = html.escape(str(value).replace("\r", ""), quote=True)
+    return text.replace("$", "&#36;").replace("\n", "<br>")
+
+
+def _head_html() -> str:
+    cells = "".join(f"<div>{label}</div>" for label in TABLE_COLUMNS)
+    return f'<div class="pt-grid pt-head">{cells}</div>'
+
+
+def _row_html(row) -> str:
+    deadline = row["Deadline"]
+    values = {
+        "Project ID": row["Project ID"],
+        "Proposal": row["Proposal"],
+        "Deadline": "" if pd.isna(deadline) else f"{deadline:%d %b %Y}",
+        "Time left": row["Time left"],
+        "Submission Mode": row["Submission Mode"],
+        "Assigned to": row["Assigned to"],
+        "Status": row["Status"],
+        "Remarks": row["Remarks"],
+    }
+    cells = "".join(f'<div class="c" data-l="{label}">{_esc(values[label])}</div>' for label in TABLE_COLUMNS)
+    color = ROW_COLORS.get(row["Status"], "")
+    style = f' style="background:{color}"' if color else ""
+    return f'<div class="pt-grid pt-row"{style}>{cells}</div>'
+
+
+SORT_OPTIONS = ["Default", "Deadline: soonest first", "Deadline: latest first",
+                "Project ID: low to high", "Project ID: high to low"]
+
+
+def apply_sort(d: pd.DataFrame, choice: str) -> pd.DataFrame:
+    """'Default' keeps decorate()'s order: open work by deadline, then closed work."""
+    if choice == "Deadline: soonest first":
+        d = d.sort_values("Deadline", na_position="last", kind="stable")
+    elif choice == "Deadline: latest first":
+        d = d.sort_values("Deadline", ascending=False, na_position="last", kind="stable")
+    elif choice == "Project ID: low to high":
+        d = d.sort_values("Project No", na_position="last", kind="stable")
+    elif choice == "Project ID: high to low":
+        d = d.sort_values("Project No", ascending=False, na_position="last", kind="stable")
+    return d.reset_index(drop=True)
+
+
+def render_table(view: pd.DataFrame, editable: bool):
+    """Draw the table. Editors get a pencil button at the start of every row.
+    Returns the record of the row whose pencil was clicked (or None)."""
+    clicked = None
+    with st.container(key="ptable"):
+        if editable:
+            h0, h1 = st.columns(EDIT_COL, vertical_alignment="center")
+            h0.markdown('<div class="pt-head-edit">Edit</div>', unsafe_allow_html=True)
+            h1.markdown(_head_html(), unsafe_allow_html=True)
+        else:
+            st.markdown(_head_html(), unsafe_allow_html=True)
+        if view.empty:
+            st.info("No proposals match your filters.")
+        for _, row in view.iterrows():
+            if editable:
+                c0, c1 = st.columns(EDIT_COL, vertical_alignment="center")
+                c1.markdown(_row_html(row), unsafe_allow_html=True)
+                if c0.button("✏️", key=f"edit_{row['ID']}", help="Edit this proposal"):
+                    clicked = row.to_dict()
+            else:
+                st.markdown(_row_html(row), unsafe_allow_html=True)
+    return clicked
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -545,10 +638,6 @@ def sidebar_access() -> None:
 def _options(base: list[str], current: list[str]) -> list[str]:
     """Keep legacy values (e.g. someone no longer in PEOPLE) selectable."""
     return base + [c for c in current if c and c not in base]
-
-
-def _bump_table() -> None:
-    st.session_state["table_version"] = st.session_state.get("table_version", 0) + 1
 
 
 def _proposal_form(record: dict | None, form_key: str) -> None:
@@ -602,7 +691,6 @@ def _proposal_form(record: dict | None, form_key: str) -> None:
     except Exception as exc:
         st.error(f"Could not save: {exc}")
         return
-    _bump_table()
     st.rerun()
 
 
@@ -614,22 +702,15 @@ def add_dialog() -> None:
 @st.dialog("Edit proposal")
 def edit_dialog(record: dict) -> None:
     _proposal_form(record, "edit_form")
-
-
-@st.dialog("Delete proposal")
-def delete_dialog(pid: str, name: str) -> None:
-    st.write(f"Delete **{name}**? This can't be undone.")
-    c1, c2 = st.columns(2)
-    if c1.button("Yes, delete", type="primary"):
-        try:
-            delete_proposal(pid)
-        except Exception as exc:
-            st.error(f"Could not delete: {exc}")
-            return
-        _bump_table()
-        st.rerun()
-    if c2.button("Cancel"):
-        st.rerun()
+    with st.expander("🗑️ Delete this proposal"):
+        st.caption("This can't be undone.")
+        if st.button("Yes, delete permanently", key="confirm_delete"):
+            try:
+                delete_proposal(record["ID"])
+            except Exception as exc:
+                st.error(f"Could not delete: {exc}")
+                return
+            st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -671,71 +752,47 @@ def main() -> None:
     # Filters
     st.markdown(_section_html("Proposals"), unsafe_allow_html=True)
     with st.container(border=True):
-        f1, f2, f3, f4, f5 = st.columns([2.4, 1.5, 1.5, 1.4, 1.5])
+        f1, f2, f3, f4, f5, f6 = st.columns([2.2, 1.4, 1.4, 1.3, 1.5, 1.3])
         search = f1.text_input("Search", placeholder="Name, Project ID or remarks…")
         statuses = f2.multiselect("Status", _options(STATUSES, sorted(set(data["Status"]) - set(STATUSES))))
         all_people = _options(PEOPLE, sorted({p for v in data["Assigned to"] for p in split_people(v)}))
         people = f3.multiselect("Assigned to", all_people)
         window = f4.selectbox("Deadline", ["Any time", "Overdue", "Next 7 days", "This month"])
-        open_only = f5.toggle("Open only", value=False, help="Hide Submitted / Not Submitted / Declined / Accepted")
+        sort_by = f5.selectbox("Sort by", SORT_OPTIONS)
+        open_only = f6.toggle("Open only", value=False, help="Hide Submitted / Not Submitted / Declined / Accepted")
 
-    view = apply_filters(data, search, statuses, people, open_only, window)
+    view = apply_sort(apply_filters(data, search, statuses, people, open_only, window), sort_by)
 
-    # Table
-    display_cols = ["Project ID", "Proposal", "Deadline", "Time left", "Submission Mode",
-                    "Assigned to", "Status", "Remarks"]
-    styled = view.style.apply(
-        lambda row: [f"background-color: {ROW_COLORS.get(row['Status'], '')}"] * len(row), axis=1
-    )
-    event = st.dataframe(
-        styled,
-        hide_index=True,
-        column_order=display_cols,
-        column_config={
-            "Project ID": st.column_config.TextColumn("Project ID", width="small"),
-            "Proposal": st.column_config.TextColumn("Proposal", width="large"),
-            "Deadline": st.column_config.DateColumn("Deadline", format="DD MMM YYYY"),
-            "Time left": st.column_config.TextColumn("Time left", width="small"),
-            "Remarks": st.column_config.TextColumn("Remarks", width="large"),
-        },
-        height=max(120, min(36 * (len(view) + 1) + 4, 720)),
-        on_select="rerun" if is_editor() else "ignore",
-        selection_mode="single-row",
-        key=f"table_{st.session_state.get('table_version', 0)}",
-        **_width_kwargs(),
-    )
-    st.caption(
-        f"{len(view)} of {len(data)} proposals · green = submitted · amber = in progress "
-        "· light blue = not started yet · red = declined / not submitted"
-    )
-
-    # Actions
-    selected = None
+    # Toolbar: Add proposal (editors) on the left, Export to Excel on the right
+    t1, t2, t3 = st.columns([1.5, 6, 1.7], vertical_alignment="center")
+    add_clicked = False
     if is_editor():
-        rows = event.selection.rows if event is not None else []
-        if rows and rows[0] < len(view):
-            selected = view.iloc[rows[0]].to_dict()
-
-    a1, a2, a3, _, a5 = st.columns([1.1, 1.1, 1.1, 2.2, 1.3])
-    if is_editor():
-        if a1.button("➕ Add proposal", type="primary"):
-            add_dialog()
-        if a2.button("✏️ Edit selected", disabled=selected is None):
-            edit_dialog(selected)
-        if a3.button("🗑️ Delete", disabled=selected is None):
-            delete_dialog(selected["ID"], selected["Proposal"])
-        if selected is None:
-            st.caption("Tip: click a row's checkbox (left edge of the table) to edit or delete it.")
-    else:
-        st.caption("🔒 View-only — to edit, open the sidebar (arrow at the top-left) and enter the team password.")
-
-    a5.download_button(
+        add_clicked = t1.button("➕ Add proposal", type="primary")
+    t2.caption(f"Showing {len(view)} of {len(data)} proposals")
+    t3.download_button(
         "⬇️ Export to Excel",
         data=to_excel_bytes(view),
         file_name=f"Proposal_Submission_Pipeline_{today:%Y-%m-%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         help="Exports the rows currently shown (respecting your filters).",
     )
+
+    # Table
+    clicked = render_table(view, editable=is_editor())
+    st.caption(
+        "green = submitted · amber = in progress · light blue = not started yet "
+        "· red = declined / not submitted"
+    )
+    if is_editor():
+        st.caption("Tip: click the ✏️ at the start of a row to edit or delete that proposal.")
+    else:
+        st.caption("🔒 View-only — to edit, open the sidebar (arrow at the top-left) and enter the team password.")
+
+    # Open dialogs only after the page has been drawn
+    if add_clicked:
+        add_dialog()
+    elif clicked is not None:
+        edit_dialog(clicked)
 
 
 if __name__ == "__main__":
